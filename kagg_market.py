@@ -1,22 +1,9 @@
 """Market order construction: hiring, land, feed, livestock, seeds.
 
-The headline fix in here is LABOR. Hire cost is fib(n) for the n-th hand of
-the day, so cumulative cost per day is:
-
-     3 hands -> $4      96 actions/day
-     6 hands -> $20    168 actions/day
-     8 hands -> $54    216 actions/day
-    12 hands -> $376   312 actions/day
-    14 hands -> $986   360 actions/day
-
-The old agent capped at 3 hands with a hard `cost <= 5` gate. That is 96
-actions/day, enough to service roughly 45 tiles, on a board that goes to 100.
-Running 12-14 hands costs under 1% of what a mature farm earns per day and
-roughly quadruples throughput. It is the single highest-leverage line here.
-
-Second fix: buy wheat, do not grow it. Growing wheat returns ~$27 per action
-spent. A cow eats one wheat a day and returns ~$405 a day. Spending farm
-actions on feed production is burning the scarcest resource in the game.
+The first benchmark exposed a fatal gating bug: the old expansion condition
+required `n_empty <= 14`, but the starting farm has 25 empty tiles. That meant
+BUY_LAND never fired on the first quadrant, so the agent could not scale into
+the production footprint used by the strong references.
 """
 
 from kagg_core import (
@@ -33,9 +20,8 @@ def build_orders(money, shed, seeds, prices, minv, day, hour, days_left,
     orders = []
     cash = money
 
-    # 1. SELL FIRST. Market orders resolve in list order, so this cash is
-    #    available to the buys below and the shed frees up for the day's
-    #    harvests before anything can overflow.
+    # Sell only when the marginal unit clears the reserve. Near-term shed
+    # pressure can override this because overflow is worse than a soft price.
     wheat_reserve = min(60, n_animals * 2)
     premium_crops = crop_counts.get("STRAWBERRY", 0) + crop_counts.get("MELON", 0)
     fert_reserve = 6 if premium_crops > 0 else 0
@@ -43,20 +29,23 @@ def build_orders(money, shed, seeds, prices, minv, day, hour, days_left,
     sales = plan_sales(shed, minv, prices, day, days_left,
                        wheat_reserve, fert_reserve, pressure)
     if hot:
-        # Shared order book. If they are dumping, get out in front of it.
         sales.sort(key=lambda o: (o[1] not in hot, -prices.get(o[1], 0)))
     for o in sales[:5]:
         orders.append(o)
-        cash += o[2] * prices.get(o[1], MP[o[1]]["base"]) * 0.85
+        # Conservative cash estimate for subsequent orders. The engine prices
+        # each unit marginally, so never assume the whole batch sells at spot.
+        cash += sum(prices.get(o[1], MP[o[1]]["base"]) * 0.65
+                    for _ in range(o[2]))
 
     if endgame:
-        # Nothing left worth investing in. Free shed space and liquidate.
         return orders[:10]
 
-    # 2. LABOR. Cheapest multiplier in the game by an order of magnitude.
+    # Hire enough hands to exploit the unlocked footprint. The daily Fibonacci
+    # cost is tiny relative to mature production, but stop during the opening
+    # if cash is genuinely scarce.
     if hour <= 1:
-        workload = n_plants + n_animals * 2.5 + len(structs) + min(n_empty, 12)
-        target = int(min(14, max(4, workload / 11.0 + 3)))
+        workload = n_plants + n_animals * 2.5 + len(structs) + min(n_empty, 24)
+        target = int(min(14, max(6, workload / 9.0 + 3)))
         if day == 0:
             target = 8
         if days_left <= 3:
@@ -70,17 +59,22 @@ def build_orders(money, shed, seeds, prices, minv, day, hour, days_left,
             hires_today += 1
             n_hands += 1
 
-    # 3. LAND. $7k total for four times the tiles. Buy it the moment we are
-    #    actually running out of ground, not before.
+    # Expansion is an investment, not a reward for already filling the farm.
+    # The previous `n_empty <= 14` gate was impossible on the starting 25-tile
+    # quadrant, so it permanently trapped the policy in NW. Buy each quadrant
+    # as soon as cash leaves a reasonable operating buffer, with a small delay
+    # only to avoid starving the opening seed/animal purchases.
     n_extra = len(unlocked) - 1
     if n_extra < len(LAND_PRICES) and days_left > 10 and len(orders) < 10:
         cost = LAND_PRICES[n_extra]
-        buffer = 600 if n_extra == 0 else 1200
-        if cash >= cost + buffer and n_empty <= 14:
+        buffer = 1100 if n_extra == 0 else (1500 if n_extra == 1 else 2200)
+        expansion_ready = (day <= 2 and n_extra == 0) or n_empty <= 18
+        if expansion_ready and cash >= cost + buffer:
             orders.append(["BUY_LAND"])
             cash -= cost
 
-    # 4. WHEAT for feed. Zero farm actions, and it keeps the herd alive.
+    # Buy wheat for feed. Growing wheat spends farm actions; buying feed does
+    # not, and keeps high-value animals producing.
     if n_animals > 0 and len(orders) < 10:
         want = min(n_animals * 3, 55) - wheat_have
         want = min(want, max(0, shed_room - 8))
@@ -91,25 +85,14 @@ def build_orders(money, shed, seeds, prices, minv, day, hour, days_left,
                 orders.append(["BUY_PRODUCT", "WHEAT", qty])
                 cash -= qty * px
 
-    # 5. LIVESTOCK for empty structures. Small batches only: bought animals
-    #    land in the shed and the shed caps at 100 items.
-    empty_pasture = 0
-    empty_coop = 0
-    for s in structs:
-        kind = s[2].get("kind")
-        if kind == "PASTURE":
-            empty_pasture += 1
-        elif kind == "COOP":
-            empty_coop += 1
-    held_animals = 0
-    for a in ANIMALS:
-        held_animals += shed.get(a, 0)
+    # Fill empty structures with livestock in small batches.
+    empty_pasture = sum(1 for s in structs if s[2].get("kind") == "PASTURE")
+    empty_coop = sum(1 for s in structs if s[2].get("kind") == "COOP")
+    held_animals = sum(shed.get(a, 0) for a in ANIMALS)
     room = min(4, shed_room - 2)
     if room > 0 and len(orders) < 10:
         wish = []
         need_p = max(0, empty_pasture - held_animals)
-        # Cows first: best dollars per action in the game, but an eight day
-        # lead time to first milk, so they have to be bought early.
         if need_p > 0 and days_left >= 11 and counts["COW"] < TGT_COW:
             wish.append(("COW", min(need_p, TGT_COW - counts["COW"])))
         elif need_p > 0 and days_left >= 9 and counts["SHEEP"] < TGT_SHEEP:
@@ -126,12 +109,9 @@ def build_orders(money, shed, seeds, prices, minv, day, hour, days_left,
                 cash -= n * cost
                 room -= n
 
-    # 6. SEEDS, only for crops that can still finish before the season ends.
+    # Seeds only for crops with enough time left to finish.
     if len(orders) < 10 and n_empty > 0:
-        seeds_held = 0
-        for v in seeds.values():
-            if v > 0:
-                seeds_held += v
+        seeds_held = sum(v for v in seeds.values() if v > 0)
         for crop, gate, cap in (("MELON", 12, TGT_MELON),
                                 ("STRAWBERRY", 13, TGT_STRAW),
                                 ("WHEAT", 3, 999)):
@@ -150,11 +130,10 @@ def build_orders(money, shed, seeds, prices, minv, day, hour, days_left,
                 cash -= qty * cost
                 seeds_held += qty
 
-    # 7. Fertilizer for the strawberries. Fertilized-and-watered doubles every
-    #    scheduled yield, so $100 of input buys about $1000 of berries.
+    # Fertilizer is reserved for premium crops.
     if (len(orders) < 10 and cash > 2500 and days_left > 6
-            and crop_counts.get("STRAWBERRY", 0) > 0
-            and shed.get("FERTILIZER", 0) < 4 and shed_room > 10):
+            and premium_crops > 0 and shed.get("FERTILIZER", 0) < 4
+            and shed_room > 10):
         orders.append(["BUY_PRODUCT", "FERTILIZER", 3])
 
     return orders[:10]
